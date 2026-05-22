@@ -20,6 +20,15 @@ static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
 
+// gerador de numero aleatorio
+static unsigned long randstate = 1;
+static unsigned
+lcg_rand(void)
+{
+  randstate = randstate * 1103515245 + 12345;
+  return (unsigned)(randstate >> 1);
+}
+
 // helps ensure that wakeups of wait()ing
 // parents are not lost. helps obey the
 // memory model when using p->parent.
@@ -124,6 +133,9 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  // todo processo comeca com 1 ticket
+  p->tickets = 1;
+  p->ticks = 0;
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -169,6 +181,8 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->tickets = 0;
+  p->ticks = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -291,6 +305,10 @@ kfork(void)
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
+
+  // herda do pai os tickets
+  np->tickets = p->tickets;
+  np->ticks = 0;
 
   release(&np->lock);
 
@@ -429,35 +447,47 @@ scheduler(void)
 
   c->proc = 0;
   for (;;) {
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
+    // enable interrupts briefly
     intr_on();
     intr_off();
 
-    int found = 0;
+    // ticket total dentre os processos RUNNABLE
+    int total = 0;
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if (p->state == RUNNABLE)
+        total += p->tickets;
+      release(&p->lock);
+    }
+
+    if (total == 0) {
+      // nothing runnable; stop until an interrupt
+      asm volatile("wfi");
+      continue;
+    }
+
+    // pick a winning ticket in [1..total]
+    unsigned winner = (lcg_rand() % total) + 1;
+    int acc = 0;
+
+    // walk process table and find the winner
     for (p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+        acc += p->tickets;
+        if (acc >= (int)winner) {
+          // select this process
+          p->state = RUNNING;
+          p->ticks++;
+          c->proc = p;
+          swtch(&c->context, &p->context);
+          // process yielded the CPU
+          c->proc = 0;
+          release(&p->lock);
+          break;
+        }
       }
       release(&p->lock);
-    }
-    if (found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
-      asm volatile("wfi");
     }
   }
 }
